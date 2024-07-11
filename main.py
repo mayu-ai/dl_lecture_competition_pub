@@ -10,6 +10,9 @@ import torch
 import torch.nn as nn
 import torchvision
 from torchvision import transforms
+from torchvision import models
+
+from transformers import BertModel, BertTokenizer
 
 
 def set_seed(seed):
@@ -60,6 +63,24 @@ def process_text(text):
 
     return text
 
+# 前処理を行う関数
+def preprocess_question(question):
+    # 小文字に統一
+    question = question.lower()
+    # 冠詞の削除
+    question = re.sub(r'\b(a|an|the)\b', '', question)
+    # 短縮形の統一
+    contractions = {
+        "can't": "cannot", "won't": "will not", "n't": " not", "'re": " are",
+        "'s": " is", "'d": " would", "'ll": " will", "'t": " not", "'ve": " have",
+        "'m": " am"
+    }
+    for key, value in contractions.items():
+        question = question.replace(key, value)
+    # 連続するスペースを1つにする
+    question = re.sub(r'\s+', ' ', question).strip()
+    return question
+
 
 # 1. データローダーの作成
 class VQADataset(torch.utils.data.Dataset):
@@ -68,6 +89,8 @@ class VQADataset(torch.utils.data.Dataset):
         self.image_dir = image_dir  # 画像ファイルのディレクトリ
         self.df = pandas.read_json(df_path)  # 画像ファイルのパス，question, answerを持つDataFrame
         self.answer = answer
+        
+        self.df['question'] = self.df['question'].apply(preprocess_question)
 
         # question / answerの辞書を作成
         self.question2idx = {}
@@ -110,7 +133,7 @@ class VQADataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         """
-        対応するidxのデータ（画像，質問，回答）を取得．
+        対応するidxのデータ（画像,質問,回答）を取得
 
         Parameters
         ----------
@@ -128,25 +151,26 @@ class VQADataset(torch.utils.data.Dataset):
         mode_answer_idx : torch.Tensor  (1)
             10人の回答者の回答の中で最頻値の回答のid
         """
-        image = Image.open(f"{self.image_dir}/{self.df['image'][idx]}")
+        image_path = f"{self.image_dir}/{self.df['image'][idx]}"
+        try:
+            image = Image.open(image_path)
+        except IOError:
+            print(f"Error: Could not open image {image_path}")
+            return None
         image = self.transform(image)
-        question = np.zeros(len(self.idx2question) + 1)  # 未知語用の要素を追加
-        question_words = self.df["question"][idx].split(" ")
-        for word in question_words:
-            try:
-                question[self.question2idx[word]] = 1  # one-hot表現に変換
-            except KeyError:
-                question[-1] = 1  # 未知語
+
+        question = self.df['question'][idx]
+        question_vector = torch.zeros(len(self.question2idx) + 1)
+        for word in question.split():
+            question_vector[self.question2idx.get(word, -1)] = 1  # 未知語は最後のインデックス
 
         if self.answer:
-            answers = [self.answer2idx[process_text(answer["answer"])] for answer in self.df["answers"][idx]]
-            mode_answer_idx = mode(answers)  # 最頻値を取得（正解ラベル）
+            answers = [self.answer2idx.get(process_text(answer['answer']), 0) for answer in self.df['answers'][idx]]  # 未知語は0にマッピング
+            mode_answer_idx = mode(answers)
+            return image, question_vector, torch.tensor(answers), torch.tensor([mode_answer_idx])
 
-            return image, torch.Tensor(question), torch.Tensor(answers), int(mode_answer_idx)
-
-        else:
-            return image, torch.Tensor(question)
-
+        return image, question_vector
+    
     def __len__(self):
         return len(self.df)
 
@@ -289,24 +313,26 @@ def ResNet50():
 
 class VQAModel(nn.Module):
     def __init__(self, vocab_size: int, n_answer: int):
-        super().__init__()
-        self.resnet = ResNet18()
-        self.text_encoder = nn.Linear(vocab_size, 512)
+        super(VQAModel, self).__init__()
+        self.resnet = models.resnet50(pretrained=True)
+        self.resnet.fc = nn.Identity()  # ResNetの最後のFC層を取り除く
+
+        # ワンホットエンコーディングされた質問のための線形層
+        self.question_encoder = nn.Linear(vocab_size, 768)  # BERTの隠れ層サイズに合わせて
 
         self.fc = nn.Sequential(
-            nn.Linear(1024, 512),
-            nn.ReLU(inplace=True),
+            nn.Linear(768 + 2048, 512),  # 線形層とResNetの出力を結合
+            nn.ReLU(),
+            nn.Dropout(0.5),
             nn.Linear(512, n_answer)
         )
 
-    def forward(self, image, question):
-        image_feature = self.resnet(image)  # 画像の特徴量
-        question_feature = self.text_encoder(question)  # テキストの特徴量
-
-        x = torch.cat([image_feature, question_feature], dim=1)
-        x = self.fc(x)
-
-        return x
+    def forward(self, images, questions):
+        image_features = self.resnet(images)
+        text_features = self.question_encoder(questions)
+        combined_features = torch.cat((image_features, text_features), dim=1)
+        output = self.fc(combined_features)
+        return output
 
 
 # 4. 学習の実装
@@ -366,19 +392,20 @@ def main():
     # dataloader / model
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
-        transforms.ToTensor()
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=transform)
     test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, answer=False)
     test_dataset.update_dict(train_dataset)
 
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True)
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=16, shuffle=False)
 
     model = VQAModel(vocab_size=len(train_dataset.question2idx)+1, n_answer=len(train_dataset.answer2idx)).to(device)
 
     # optimizer / criterion
-    num_epoch = 20
+    num_epoch = 15
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
 
@@ -397,13 +424,16 @@ def main():
     for image, question in test_loader:
         image, question = image.to(device), question.to(device)
         pred = model(image, question)
-        pred = pred.argmax(1).cpu().item()
-        submission.append(pred)
+        # バッチ処理された予測結果の各要素をリストに追加
+        predictions = pred.argmax(1).cpu().tolist()  # .tolist()で全要素をリストとして取得
+        submission.extend(predictions)  # extendを使ってリストに追加
 
+    # 提出用の予測結果をIDから実際の回答に変換
     submission = [train_dataset.idx2answer[id] for id in submission]
     submission = np.array(submission)
     torch.save(model.state_dict(), "model.pth")
     np.save("submission.npy", submission)
+
 
 if __name__ == "__main__":
     main()
